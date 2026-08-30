@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from raytracer.image.color import Color
-
 import math
 
-class Material:
-    """Surface appearance properties for the Phong reflection model."""
+from raytracer.image.color import Color
 
-    __slots__ = ("color", "ambient", "diffuse", "specular", "shininess", "reflective", "transparency", "refractive_index")
+
+class Material:
+    __slots__ = (
+        "color", "ambient", "diffuse", "specular", "shininess",
+        "reflective", "transparency", "refractive_index", "emissive",
+    )
 
     def __init__(
         self,
@@ -19,6 +21,7 @@ class Material:
         reflective: float = 0.0,
         transparency: float = 0.0,
         refractive_index: float = 1.0,
+        emissive: Color | None = None,
     ) -> None:
         self.color = color
         self.ambient = ambient
@@ -28,12 +31,11 @@ class Material:
         self.reflective = reflective
         self.transparency = transparency
         self.refractive_index = refractive_index
+        self.emissive = emissive if emissive is not None else Color(0, 0, 0)
 
     def __eq__(self, other: object) -> bool:
-
         if not isinstance(other, Material):
             return NotImplemented
-
         return (
             self.color == other.color
             and math.isclose(self.ambient, other.ambient, abs_tol=1e-9)
@@ -43,7 +45,14 @@ class Material:
             and math.isclose(self.reflective, other.reflective, abs_tol=1e-9)
             and math.isclose(self.transparency, other.transparency, abs_tol=1e-9)
             and math.isclose(self.refractive_index, other.refractive_index, abs_tol=1e-9)
+            and self.emissive == other.emissive
         )
 
     def __repr__(self) -> str:
-        return f"Color: {self.color}, Ambient: {self.ambient}, Diffuse: {self.diffuse}, Specular: {self.diffuse}, Shininess: {self.shininess}, Reflective: {self.reflective}, Transparency: {self.transparency}, Refractive Index: {self.refractive_index}"
+        return (
+            f"Color: {self.color}, Ambient: {self.ambient}, "
+            f"Diffuse: {self.diffuse}, Specular: {self.specular}, "
+            f"Shininess: {self.shininess}, Reflective: {self.reflective}, "
+            f"Transparency: {self.transparency}, RefractiveIndex: {self.refractive_index}, "
+            f"Emissive: {self.emissive}"
+        )

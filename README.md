@@ -29,23 +29,27 @@ from first principles.
 
 ```
 src/raytracer/
-    geometry/       Point, Vector, Ray, Matrix, transforms, Intersection, Computations
-    shapes/         Shape (base), Sphere, Plane, Triangle
+    geometry/       Point, Vector, Ray, Matrix, transforms, Intersection,
+                     Computations, BoundingBox, sampling (Monte Carlo helpers)
+    shapes/         Shape (base), Sphere, Plane, Triangle, Mesh (BVH-accelerated)
     rendering/      Camera, PointLight, Material, lighting(), renderer
+                     (deterministic), path_tracer (Monte Carlo)
     scene/          World, OBJ mesh parser, procedural mesh generators
-    image/          Color, Canvas, PPM serialization
 
 tests/
     unit/           Mirrors the src/ structure, one test file per module
     integration/    End-to-end render/shadow/transform tests
 
 examples/
-    render_scene.py            A single hand-built scene, rendered to PPM
+    generate_render.py         Configurable CLI: scene/camera/mode via arguments
+                                (deterministic or path-traced, in one script)
     random_scene_profiler.py   Generates & profiles a batch of random scenes
     mesh_profile.py            Profiles a procedurally generated triangle mesh
+    path_tracing_test.py       Validates path tracer convergence (sanity checks
+                                + numeric + visual)
 
 docs/
-    01-14 phase-by-phase study notes: theory, derivations, design
+    01-15 phase-by-phase study notes: theory, derivations, design
     decisions, bugs found and fixed, and testing strategy for each phase.
 
 renders/            Output directory for rendered .ppm files
@@ -93,25 +97,47 @@ ruff check src/ tests/   # linting
 mypy src/ --strict       # static type checking
 ```
 
-The full suite (as of Phase 13) is 179 tests across geometry, shapes,
+The full suite (as of Phase 15) is 206 tests across geometry, shapes,
 image, rendering, and scene modules, including property-based tests for
 every major mathematical invariant (vector normalization, matrix
-inverses, rotation periodicity, cross-product perpendicularity, etc.).
+inverses, rotation periodicity, cross-product perpendicularity,
+cosine-weighted-sample hemisphere membership, etc.), a pixel-perfect
+BVH-vs-brute-force equivalence test, and a statistical variance-reduction
+test for the path tracer.
 
 ## Generating a Render
 
+A single configurable entry point handles both rendering modes:
+
 ```bash
-python examples/render_scene.py 200 100 renders/my_scene.ppm
+# Deterministic (Phong + shadows + reflection + refraction), default scene/camera
+python examples/generate_render.py
+
+# Higher resolution, custom output path
+python examples/generate_render.py --hsize 400 --vsize 200 --output renders/big.ppm
+
+# Path-traced (Monte Carlo), reproducible via a fixed seed
+python examples/generate_render.py --mode path-trace --samples 128 --max-depth 5 --seed 7
+
+# Custom camera position, target, and field of view
+python examples/generate_render.py --camera-from 0 2 -6 --camera-to 0 1 0 --fov 60
+
+# Also save a PNG alongside the PPM (requires Pillow)
+python examples/generate_render.py --png
 ```
 
-Arguments are `hsize vsize output_path`, all optional (defaults: 200x100
-to `renders/scene.ppm`). A progress bar (via `tqdm`) shows per-row
-rendering progress; pass `show_progress=False` to `render()` directly if
-scripting a batch of renders where per-render progress bars would just
-add noise.
+Run `python examples/generate_render.py --help` for the full argument
+list. Path-traced renders default to a scene with an emissive ceiling
+(no `PointLight`) since path tracing needs something actually emitting
+light to bounce off of; deterministic renders use a `PointLight`-lit
+scene instead.
+
+A progress bar (via `tqdm`) shows per-row rendering progress in either
+mode; pass `--no-progress` when scripting many renders back-to-back,
+where per-render progress bars would just add noise.
 
 `.ppm` files are plain-text and not natively viewable in most image
-viewers. Convert with:
+viewers. Convert with `--png` above, or manually:
 
 ```bash
 # via Pillow
@@ -120,6 +146,52 @@ python -c "from PIL import Image; Image.open('renders/my_scene.ppm').save('rende
 # or via ImageMagick, if installed
 convert renders/my_scene.ppm renders/my_scene.png
 ```
+
+## Bounding Volume Hierarchy (Mesh Acceleration)
+
+Triangle meshes (whether loaded from OBJ or procedurally generated) can
+be wrapped in a `Mesh`, which builds a bounding-volume hierarchy (BVH)
+over the triangles and prunes entire subtrees a ray couldn't possibly hit,
+instead of testing every triangle individually:
+
+```python
+from raytracer.shapes.mesh import Mesh
+from raytracer.scene.mesh_generators import uv_sphere_triangles
+
+triangles = uv_sphere_triangles(radius=1.5, latitude_segments=20, longitude_segments=20)
+mesh = Mesh(triangles)
+world = World(objects=[floor, mesh], lights=[light])  # add Mesh directly, like any shape
+```
+
+This was built and adopted only after profiling confirmed render time
+scales *linearly* with triangle count under brute-force testing (see
+`docs/14-performance-and-profiling.md`) — not assumed necessary up front.
+A direct correctness check (BVH-accelerated render vs. brute-force render
+of the same scene, pixel-by-pixel) showed **zero mismatches with a 44x
+speedup** on an 800-triangle test mesh; that comparison is a permanent
+regression test in `tests/unit/shapes/test_mesh.py`.
+
+## Path Tracing (Physically Based Rendering)
+
+`World.path_trace(ray, depth, rng)` implements Monte Carlo path tracing:
+a stochastic estimator of the full rendering equation (direct lighting +
+recursively sampled indirect lighting via cosine-weighted hemisphere
+sampling), bounded by both a hard recursion-depth cap and Russian
+roulette for unbiased early termination. A single call is one noisy
+sample; `render_path_traced()` (in `rendering/path_tracer.py`) averages
+many samples per pixel, converging toward a physically based image as
+sample count increases — at the cost of significantly more render time
+and visible noise at low sample counts.
+
+Materials can now carry an `emissive` color, letting geometry itself act
+as a light source (the physically-based convention), independent of the
+existing `PointLight` mechanism used by deterministic rendering.
+
+See `docs/15-path-tracing.md` for the full derivation (the rendering
+equation, Monte Carlo integration, cosine-weighted importance sampling,
+Russian roulette) and `examples/path_tracing_test.py` for the
+convergence-validation methodology used to confirm it actually works
+before trusting any render it produces.
 
 ## Profiling
 
@@ -163,15 +235,21 @@ regardless of what else the machine was doing during the run.
 
 ## Current Status
 
-Phases 1 through 13 are implemented and tested (points/vectors through
-reflection/refraction). Phase 14 (performance/acceleration) is in
-progress: several profiling-driven optimizations have been made (cached
-transform inverses, a hand-rolled cross product replacing `np.cross`, and
-removing NumPy-array backing from `Point`/`Vector`/`Color` in favor of
-plain Python floats — each backed by measured before/after profiling
-evidence in `docs/14-performance-and-profiling.md`), and a bounding-volume
-hierarchy is the next piece of work, justified by confirmed linear
-scaling of render time with triangle count on unaccelerated meshes.
+All 15 phases of the original roadmap are implemented and tested — from
+Points and Vectors through Monte Carlo path tracing. The project's full
+test suite (206 tests) passes, including property-based mathematical
+invariant tests, a pixel-perfect BVH-vs-brute-force equivalence check, and
+statistical convergence/variance tests for the stochastic path tracer.
+
+Phase 14 (performance) in particular is documented as a real investigative
+process, not a checklist: every optimization (cached transform inverses,
+a hand-rolled cross product replacing `np.cross`, removing NumPy-array
+backing from `Point`/`Vector`/`Color`, and finally the BVH itself) is
+backed by concrete before/after `cProfile` evidence in
+`docs/14-performance-and-profiling.md` — including two cases where an
+initial fix attempt was verified *not* to have worked (via call-count
+evidence, not just wall-clock time) and had to be corrected before being
+trusted.
 
 See `docs/` for the full phase-by-phase theory, derivations, design
 decisions, and lessons learned (including real bugs found and fixed along
@@ -193,5 +271,27 @@ cause is often more instructive than the corrected formula alone).
 - [x] Phase 11 — OBJ / Mesh Support
 - [x] Phase 12 — Reflection
 - [x] Phase 13 — Refraction
-- [ ] Phase 14 — Performance / Acceleration (profiling done; BVH in progress)
-- [ ] Phase 15 — Path Tracing (Monte Carlo / physically based rendering)
+- [x] Phase 14 — Performance / Acceleration (profiling-driven fixes + BVH)
+- [x] Phase 15 — Path Tracing (Monte Carlo / physically based rendering)
+
+## Where to Go From Here
+
+The roadmap is complete, but a project like this never runs out of
+legitimate next steps, should you want to keep going:
+
+- **Surface-area-heuristic (SAH) BVH construction** — the current BVH uses
+  a simple largest-extent-axis median split; a proper SAH-based split
+  would build a measurably better tree for irregular meshes.
+- **Importance sampling toward lights** in the path tracer, rather than
+  only cosine-weighted hemisphere sampling — would substantially reduce
+  variance (and thus required sample count) for scenes with small,
+  bright light sources.
+- **Textures** — currently every material has a single flat color;
+  UV-mapped image textures would be a natural extension of the OBJ/mesh
+  work in Phase 11.
+- **Multi-threading or multiprocessing** the per-pixel render loop —
+  each pixel's computation is fully independent, making this an
+  embarrassingly parallel workload that was left single-threaded
+  throughout this project by design, to keep the profiling story in
+  Phase 14 simple and attributable to algorithmic/data-representation
+  choices rather than parallelism.
